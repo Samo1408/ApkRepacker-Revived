@@ -81,6 +81,10 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # "tools" is a retired SDK package and causes sdkmanager to fail.
+          # Install only platform-tools here; project-specific packages are installed below.
+          packages: platform-tools
 
       - name: Install Android SDK packages
         shell: bash
@@ -93,7 +97,7 @@ jobs:
           if [ -n "${{ steps.detect.outputs.ndk_version }}" ]; then
             PACKAGES="$PACKAGES ndk;${{ steps.detect.outputs.ndk_version }}"
           fi
-          yes | sdkmanager --licenses >/dev/null || true
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
           sdkmanager $PACKAGES
 
       - name: Build with Gradle
