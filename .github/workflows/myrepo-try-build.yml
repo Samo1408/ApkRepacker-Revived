@@ -1,0 +1,119 @@
+name: Try Build Workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_task:
+        description: 'Gradle task to run (for example assembleDebug or assembleRelease)'
+        required: false
+        default: 'assembleDebug'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: try-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Detect environment and build Android project
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Detect project layout and build environment
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          WRAPPER=$(find . -type f -name gradlew -not -path '*/.git/*' -not -path '*/build/*' | head -1 || true)
+          if [ -n "$WRAPPER" ]; then
+            GRADLE_DIR=$(dirname "$WRAPPER")
+          else
+            echo "No Gradle wrapper (gradlew) was found. Add the project's Gradle wrapper and rerun this workflow." >&2
+            exit 1
+          fi
+          echo "gradle_dir=$GRADLE_DIR" >> "$GITHUB_OUTPUT"
+          WRAPPER_PROPS="$GRADLE_DIR/gradle/wrapper/gradle-wrapper.properties"
+          GRADLE_VERSION=""
+          if [ -f "$WRAPPER_PROPS" ]; then
+            GRADLE_VERSION=$(grep -oE 'gradle-[0-9]+(\.[0-9]+)*-(bin|all)\.zip' "$WRAPPER_PROPS" | head -1 | sed -E 's/^gradle-//;s/-(bin|all)\.zip$//' || true)
+          fi
+          echo "gradle_version=$GRADLE_VERSION" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import re, pathlib
+          files = [pathlib.Path('build.gradle'), pathlib.Path('build.gradle.kts'), pathlib.Path('app/build.gradle'), pathlib.Path('app/build.gradle.kts'), pathlib.Path('android/app/build.gradle'), pathlib.Path('android/app/build.gradle.kts')]
+          text = '\n'.join(p.read_text(errors='ignore') for p in files if p.is_file())
+          java = '17'
+          patterns = [r'jvmToolchain\s*\(\s*(\d+)\s*\)', r'JavaLanguageVersion\.of\s*\(\s*(\d+)\s*\)', r'VERSION_(1_)?(\d+)']
+          for pattern in patterns:
+              m = re.search(pattern, text)
+              if m:
+                  nums = [g for g in m.groups() if g]
+                  java = nums[-1].replace('_', '')
+                  break
+          compile_sdk = '35'
+          m = re.search(r'compileSdk(?:Version)?\s*(?:=\s*)?(?:\(\s*)?(\d+)', text)
+          if m: compile_sdk = m.group(1)
+          ndk = ''
+          m = re.search(r'ndkVersion\s*(?:=\s*)?["\']([^"\']+)', text)
+          if m: ndk = m.group(1)
+          build_tools = ''
+          m = re.search(r'buildToolsVersion\s*(?:=\s*)?["\']([^"\']+)', text)
+          if m: build_tools = m.group(1)
+          print(f'java_version={java}')
+          print(f'compile_sdk={compile_sdk}')
+          print(f'ndk_version={ndk}')
+          print(f'build_tools={build_tools}')
+          PY
+          echo "Gradle directory: $GRADLE_DIR"
+          echo "Gradle wrapper version: ${GRADLE_VERSION:-project wrapper default}"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.detect.outputs.java_version }}
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGES="platform-tools platforms;android-${{ steps.detect.outputs.compile_sdk }}"
+          if [ -n "${{ steps.detect.outputs.build_tools }}" ]; then
+            PACKAGES="$PACKAGES build-tools;${{ steps.detect.outputs.build_tools }}"
+          fi
+          if [ -n "${{ steps.detect.outputs.ndk_version }}" ]; then
+            PACKAGES="$PACKAGES ndk;${{ steps.detect.outputs.ndk_version }}"
+          fi
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager $PACKAGES
+
+      - name: Build with Gradle
+        working-directory: ${{ steps.detect.outputs.gradle_dir }}
+        shell: bash
+        env:
+          BUILD_TASK: ${{ inputs.build_task }}
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          TASK="${BUILD_TASK:-assembleDebug}"
+          echo "Running Gradle task: $TASK"
+          ./gradlew "$TASK" --no-daemon --stacktrace --console=plain
+
+      - name: Upload APK outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: try-build-apk-${{ github.run_number }}
+          path: |
+            **/build/outputs/apk/**/*.apk
+          if-no-files-found: warn
+          retention-days: 7
